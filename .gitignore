@@ -15,3 +15,7 @@ wheels/
 
 # Local experiment reports, samples, and trained models
 runs/
+
+# Local agent instructions and work plans
+/AGENTS.md
+/PLAN.md
