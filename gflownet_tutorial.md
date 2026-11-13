@@ -46,7 +46,7 @@ $$
 \varnothing\to\{2\}\to\{0,2\}\to\{0,1,2\}.
 $$
 
-![从空集逐个加入元素的 DAG](assets/gflownet_tutorial/set-generation-dag.svg)
+![从空集逐个加入元素的 DAG](assets/gflownet_tutorial/set-generation-dag.png)
 
 青绿色是上述第一条路径，珊瑚色是上述第二条路径。一共有 3! = 6 条通往同一个终态 {0,1,2} 的路径，其他合法路径由灰色表示。
 
@@ -468,7 +468,7 @@ $$
 
 用数字把这本账走一遍。设 $R(x)=5,\ R(y)=3$。其中 $x$ 有两条构造路径，$y$ 只有一条。图中数字是边 flow；终态奖励要由到达它的路径共同分担：
 
-![五节点守恒 flow 图](assets/gflownet_tutorial/flow-dag.svg)
+![五节点守恒 flow 图](assets/gflownet_tutorial/flow-dag.png)
 
 中间节点流入等于流出。同一个终态的奖励可以分到不同路径上，路径条数本身不是额外奖励。
 
