@@ -1,44 +1,94 @@
-# /// script
-# requires-python = ">=3.11,<3.14"
-# dependencies = [
-#   "jax[cpu]==0.7.2",
-#   "flax==0.11.2",
-#   "optax==0.2.6",
-#   "numpy==2.2.6",
-# ]
-# ///
 """Trajectory Balance GFlowNet: 从 5 个元素中无序地选 3 个。
 
-运行（uv 自动安装上面锁定的 CPU 依赖）:
-    uv run --script gflownet_nnx_tutorial.py
-    uv run --script gflownet_nnx_tutorial.py --backward uniform
+运行（使用项目 uv.lock 和 .venv）::
 
-默认学习 P_F、P_B、log Z；uniform 模式固定 P_B 为均匀删除。
+    uv run python gflownet_nnx_tutorial.py
+    uv run python gflownet_nnx_tutorial.py --backward uniform
+    uv run python gflownet_nnx_tutorial.py --checkpoint runs/<run>/model.msgpack
+
+默认学习 P_F、P_B、log Z；``--backward uniform`` 固定 P_B 为均匀删除。
 训练只评估采到的终态的 log R，不使用精确 Z 或枚举数据。
 训练后枚举 60 条轨迹，验证 10 个终态的概率，再检验实际采样。
 与配套 HTML 的函数名、代码块和符号对应。
+
+本文件只保留模型、采样、TB loss 与训练；CLI / 诊断 / checkpoint 在 utility。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from itertools import combinations, permutations
-from pathlib import Path
+from functools import partial
 
-import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
 
-N_ITEMS = 5
-SET_SIZE = 3
+from utility import (
+    N_ITEMS,
+    SET_SIZE,
+    enumerate_terminals,
+    evaluate,
+    exact_diagnostics,
+    generate_samples,
+    load_model,
+    parse_args,
+    run_experiment,
+    sample_diagnostics,
+    save_model,
+    summarize_samples,
+)
+
+# Public re-exports used by tests and callers of this tutorial module.
+__all__ = [
+    "N_ITEMS",
+    "SET_SIZE",
+    "PolicyMLP",
+    "SetGFlowNet",
+    "enumerate_terminals",
+    "evaluate",
+    "exact_diagnostics",
+    "generate_samples",
+    "load_model",
+    "log_reward",
+    "masked_log_softmax",
+    "parse_args",
+    "sample_actions",
+    "sample_backward",
+    "sample_diagnostics",
+    "save_model",
+    "summarize_samples",
+    "tb_loss",
+    "train",
+    "train_step",
+    "trajectory_statistics",
+]
 
 
 def log_reward(bits: jax.Array) -> jax.Array:
-    """返回终态 log R；两个偏好的集合分别是 {0,1,2}、{2,3,4}。"""
+    """计算终态的 log 奖励 ``log R(s)``。
+
+    奖励在两个偏好集合上峰值：``{0,1,2}`` 与 ``{2,3,4}``。对每个 mode，
+    用对称差大小的一半作距离，再对两个 Boltzmann 权重取 ``logaddexp``。
+
+    Args:
+        bits: float32，形状 ``[..., 5]``，取值为 0/1，表示已选元素。
+
+    Returns:
+        float32，形状 ``[...]``，每个终态的 ``log R``。
+
+    Examples:
+        恰好等于 mode A ``{0,1,2}`` 时距离为 0，奖励接近 1（log ≈ 0）::
+
+            >>> float(log_reward(jnp.array([1.0, 1.0, 1.0, 0.0, 0.0])))
+            0.006715...  # logaddexp(0, -5)
+
+        批量输入保持前缀维度::
+
+            >>> log_reward(jnp.zeros((2, 5))).shape
+            (2,)
+    """
     mode_a = jnp.array([1, 1, 1, 0, 0], dtype=jnp.float32)
     mode_b = jnp.array([0, 0, 1, 1, 1], dtype=jnp.float32)
     distance_a = 0.5 * jnp.abs(bits - mode_a).sum(axis=-1)
@@ -47,43 +97,114 @@ def log_reward(bits: jax.Array) -> jax.Array:
 
 
 def masked_log_softmax(logits: jax.Array, legal: jax.Array) -> jax.Array:
-    """只在合法动作上归一化；调用方保证每行至少一个合法动作。"""
+    """只在合法动作上做 log-softmax；非法位置为 ``-inf``。
+
+    调用方须保证每行至少一个合法动作，否则该行会得到 NaN。
+
+    Args:
+        logits: float32，形状 ``[..., 5]``，未归一化动作分数。
+        legal: 与 ``logits`` 同形状的布尔/0-1 mask；True/1 表示合法。
+
+    Returns:
+        float32，形状 ``[..., 5]``；合法位置上的 log 概率，非法位置为 ``-inf``。
+
+    Examples:
+        空集上可添加任意元素，log 概率均匀为 ``log(1/5)``::
+
+            >>> masked_log_softmax(jnp.zeros(5), jnp.ones(5, dtype=bool))
+            Array([-1.609438, ...], dtype=float32)
+
+        已选 ``{0,1}`` 时只能添加 2/3/4::
+
+            >>> state = jnp.array([1.0, 1.0, 0.0, 0.0, 0.0])
+            >>> masked_log_softmax(jnp.zeros(5), state == 0)
+            Array([-inf, -inf, -1.0986, -1.0986, -1.0986], dtype=float32)
+    """
     masked_logits = jnp.where(legal, logits, -jnp.inf)
     return jax.nn.log_softmax(masked_logits, axis=-1)
 
 
 class PolicyMLP(nnx.Module):
-    """输入 5 维 bit state，输出 5 个动作的未归一化 logits。"""
+    """两层 SiLU MLP：5 维 bit state → 5 个动作 logits。"""
 
     def __init__(self, *, rngs: nnx.Rngs, width: int = 64):
-        """建立两个隐藏层；nnx.Linear 的权重和偏置都是 nnx.Param。"""
+        """建立两个隐藏层；``nnx.Linear`` 的权重和偏置都是 ``nnx.Param``。
+
+        Args:
+            rngs: NNX 随机流，用于初始化线性层。
+            width: 隐藏层宽度，默认 64。
+        """
         self.fc1 = nnx.Linear(N_ITEMS, width, rngs=rngs)
         self.fc2 = nnx.Linear(width, width, rngs=rngs)
         self.out = nnx.Linear(width, N_ITEMS, rngs=rngs)
 
     def __call__(self, state: jax.Array) -> jax.Array:
-        """对单个 state 或 [batch, 5] states 计算 logits。"""
+        """对单个或批量 state 计算未归一化 logits。
+
+        Args:
+            state: float32，形状 ``[5]`` 或 ``[batch, 5]``。
+
+        Returns:
+            float32，形状与 ``state`` 相同前缀、末维为 5 的 logits。
+        """
         h = jax.nn.silu(self.fc1(state))
         h = jax.nn.silu(self.fc2(h))
         return self.out(h)
 
 
 class SetGFlowNet(nnx.Module):
-    """分别参数化 P_F、可选的 P_B，以及标量 z = log Z。"""
+    """分别参数化前向策略 P_F、可选反向策略 P_B，以及标量 ``z = log Z``。"""
 
-    def __init__(self, *, rngs: nnx.Rngs, learn_backward: bool = True):
-        """uniform 模式不建立反向网络，因此没有未使用的反向参数。"""
-        self.forward = PolicyMLP(rngs=rngs)
-        self.backward = PolicyMLP(rngs=rngs) if learn_backward else None
+    def __init__(self, *, rngs: nnx.Rngs, learn_backward: bool = True, width: int = 64):
+        """构造网络。
+
+        ``learn_backward=False``（CLI 的 uniform 模式）不建立反向 MLP，
+        因此没有未使用的反向参数；此时 ``backward_log_probs`` 退化为均匀删除。
+
+        Args:
+            rngs: NNX 随机流。
+            learn_backward: 是否学习 P_B；False 时固定均匀反向。
+            width: 策略 MLP 隐藏宽度。
+        """
+        self.width = width
+        self.forward = PolicyMLP(rngs=rngs, width=width)
+        self.backward = PolicyMLP(rngs=rngs, width=width) if learn_backward else None
         self.log_z = nnx.Param(jnp.array(0.0, dtype=jnp.float32))
 
     def forward_log_probs(self, state: jax.Array) -> jax.Array:
-        """前向添加一个未选元素；只在 |state| < 3 时调用。"""
+        """前向：从 ``state`` 添加一个尚未选中的元素。
+
+        只应在 ``|state| < SET_SIZE`` 时调用。
+
+        Args:
+            state: float32，``[..., 5]``，当前已选集的 bit 向量。
+
+        Returns:
+            float32，``[..., 5]``，在 ``state == 0`` 位置上归一化的 ``log P_F``。
+
+        Examples:
+            空集上 5 个添加动作合法；部分填满后只对未选位置归一化::
+
+                >>> model = SetGFlowNet(rngs=nnx.Rngs(0), width=8)
+                >>> model.forward_log_probs(jnp.zeros(5)).shape
+                (5,)
+        """
         return masked_log_softmax(self.forward(state), state == 0)
 
     def backward_log_probs(self, child: jax.Array) -> jax.Array:
-        """从 child 删除一个已有元素；不能在空集 source 上调用。"""
-        logits = self.backward(child) if self.backward is not None else jnp.zeros_like(child)
+        """反向：从 ``child`` 删除一个已有元素。
+
+        不能在空集 source 上调用。无反向网络时，对已选元素给出均匀 ``log P_B``。
+
+        Args:
+            child: float32，``[..., 5]``，非空 bit 向量。
+
+        Returns:
+            float32，``[..., 5]``，在 ``child == 1`` 位置上归一化的 ``log P_B``。
+        """
+        logits = (
+            self.backward(child) if self.backward is not None else jnp.zeros_like(child)
+        )
         return masked_log_softmax(logits, child == 1)
 
 
@@ -94,7 +215,34 @@ def sample_actions(
     initial_state: jax.Array,
     epsilon: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """从全零 source 批量采 3 步；epsilon 只控制收集数据时的探索。"""
+    """按 ε-greedy 行为策略从空集采 ``SET_SIZE`` 步添加动作。
+
+    ``epsilon`` 只控制训练探索；评估应传入 0。每一步使用独立子 key。
+    ``categorical`` 需要 logits，因此对行为概率取 ``log``。
+
+    Args:
+        model: 当前 GFlowNet（读 ``P_F``）。
+        key: JAX PRNG key。
+        initial_state: float32，``[batch, 5]``，通常全 0。
+        epsilon: float32 标量，探索率 ∈ [0, 1]。
+
+    Returns:
+        ``(actions, terminal)``：
+
+        - ``actions``: int32，``[batch, 3]``，添加顺序（可含重复则非法）。
+        - ``terminal``: float32，``[batch, 5]``，对应的 3-元终态 bit 向量。
+
+    Examples:
+        无探索时采样一批轨迹::
+
+            >>> model = SetGFlowNet(rngs=nnx.Rngs(0), width=8)
+            >>> init = jnp.zeros((4, 5))
+            >>> actions, terminal = sample_actions(
+            ...     model, jax.random.key(0), init, jnp.array(0.0)
+            ... )
+            >>> actions.shape, terminal.shape
+            ((4, 3), (4, 5))
+    """
     state = initial_state
     actions = []
     for _ in range(SET_SIZE):
@@ -103,7 +251,6 @@ def sample_actions(
         legal = (state == 0).astype(jnp.float32)
         uniform = legal / legal.sum(axis=-1, keepdims=True)
         behavior = (1.0 - epsilon) * jnp.exp(log_pf) + epsilon * uniform
-        # categorical 接受 logits / log probabilities，不接受 probabilities。
         action = jax.random.categorical(action_key, jnp.log(behavior), axis=-1)
         actions.append(action)
         state = state.at[jnp.arange(state.shape[0]), action].set(1.0)
@@ -114,7 +261,28 @@ def sample_actions(
 def sample_backward(
     model: SetGFlowNet, key: jax.Array, terminal: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    """从完整 3 元集合按 P_B 采删除序列；每行最终回到空集。"""
+    """从完整 3 元集合按 ``P_B`` 采删除序列，直到回到空集。
+
+    Args:
+        model: 当前 GFlowNet（读 ``P_B`` 或均匀反向）。
+        key: JAX PRNG key。
+        terminal: float32，``[batch, 5]``，每个样本恰有 3 个 1。
+
+    Returns:
+        ``(removals, source)``：
+
+        - ``removals``: int32，``[batch, 3]``，删除顺序。
+        - ``source``: float32，``[batch, 5]``，应为全 0。
+
+    Examples:
+        ::
+
+            >>> model = SetGFlowNet(rngs=nnx.Rngs(0), width=8)
+            >>> terminal = jnp.array([[1.0, 1.0, 1.0, 0.0, 0.0]])
+            >>> removals, source = sample_backward(model, jax.random.key(1), terminal)
+            >>> removals.shape, float(source.sum())
+            ((1, 3), 0.0)
+    """
     state = terminal
     removals = []
     for _ in range(SET_SIZE):
@@ -128,7 +296,32 @@ def sample_backward(
 def trajectory_statistics(
     model: SetGFlowNet, actions: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """固定已采 actions 重放轨迹，累加当前 P_F 和 P_B 的 log 概率。"""
+    """固定已采 ``actions`` 重放轨迹，累加当前 ``P_F`` / ``P_B`` 的 log 概率。
+
+    反向概率必须在添加后的 child 上评估；逆动作是删除同一个元素。
+
+    Args:
+        model: 当前 GFlowNet。
+        actions: int32，``[batch, 3]``，每行是一条添加顺序。
+
+    Returns:
+        ``(log_pf, log_pb, log_r, terminal)``，均为 batch 向量（末项为 ``[batch, 5]``）：
+
+        - ``log_pf``: 轨迹前向 log 概率之和。
+        - ``log_pb``: 轨迹反向 log 概率之和。
+        - ``log_r``: 终态 ``log R``。
+        - ``terminal``: 重放得到的终态 bit 向量。
+
+    Examples:
+        单条路径 ``0→1→2``::
+
+            >>> model = SetGFlowNet(rngs=nnx.Rngs(0), width=8)
+            >>> log_pf, log_pb, log_r, terminal = trajectory_statistics(
+            ...     model, jnp.array([[0, 1, 2]], dtype=jnp.int32)
+            ... )
+            >>> terminal
+            Array([[1., 1., 1., 0., 0.]], dtype=float32)
+    """
     batch_size = actions.shape[0]
     rows = jnp.arange(batch_size)
     state = jnp.zeros((batch_size, N_ITEMS), dtype=jnp.float32)
@@ -138,16 +331,26 @@ def trajectory_statistics(
         action = actions[:, t]
         log_pf += model.forward_log_probs(state)[rows, action]
         child = state.at[rows, action].set(1.0)
-        # 必须在 child 上评估反向概率；逆动作是删除同一个 action。
         log_pb += model.backward_log_probs(child)[rows, action]
         state = child
     return log_pf, log_pb, log_reward(state), state
 
 
 def tb_loss(model: SetGFlowNet, actions: jax.Array) -> jax.Array:
-    """TB residual 平方的 batch 均值；reward 固定，actions 不参与微分。"""
+    """Trajectory Balance residual 平方的 batch 均值。
+
+    目标：``log Z + log P_F(τ) ≈ log R(x) + log P_B(τ|x)``。
+    ``actions`` 与 reward 视为常数，不对离散采样路径反传。
+
+    Args:
+        model: 含 ``log_z``、``P_F``、``P_B`` 的网络。
+        actions: int32，``[batch, 3]``，固定的采样轨迹。
+
+    Returns:
+        float32 标量，``mean((log Z + log P_F - log R - log P_B)^2)``。
+    """
     log_pf, log_pb, log_r, _ = trajectory_statistics(model, actions)
-    residual = model.log_z.value + log_pf - log_r - log_pb
+    residual = model.log_z[...] + log_pf - log_r - log_pb
     return jnp.mean(jnp.square(residual))
 
 
@@ -155,122 +358,105 @@ def tb_loss(model: SetGFlowNet, actions: jax.Array) -> jax.Array:
 def train_step(
     model: SetGFlowNet, optimizer: nnx.Optimizer, actions: jax.Array
 ) -> jax.Array:
-    """只更新模型中 nnx.Param：前向/反向 MLP 和 log_z。"""
-    loss, grads = nnx.value_and_grad(
-        tb_loss, argnums=nnx.DiffState(0, nnx.Param)
-    )(model, actions)
+    """对一批固定轨迹做一次 TB 梯度更新。
+
+    只更新 ``nnx.Param``：前向/反向 MLP 与 ``log_z``。
+
+    Args:
+        model: 可训练的 ``SetGFlowNet``（原地更新）。
+        optimizer: 绑定到 ``nnx.Param`` 的 Optax 优化器包装。
+        actions: int32，``[batch, 3]``。
+
+    Returns:
+        float32 标量，更新前的 TB loss。
+    """
+    loss, grads = nnx.value_and_grad(tb_loss, argnums=nnx.DiffState(0, nnx.Param))(
+        model, actions
+    )
     optimizer.update(model, grads)
     return loss
 
 
 def train(args: argparse.Namespace) -> tuple[SetGFlowNet, list[dict]]:
-    """每轮先探索采轨迹，再把离散动作固定下来进行一次 TB 更新。"""
-    model = SetGFlowNet(rngs=nnx.Rngs(args.seed), learn_backward=args.backward == "learned")
-    optimizer = nnx.Optimizer(model, optax.adam(2e-3), wrt=nnx.Param)
+    """每轮先探索采样轨迹，再固定离散动作做一次 TB 更新。
+
+    Args:
+        args: CLI 命名空间；使用 ``seed``、``backward``、``width``、
+            ``learning_rate``、``batch_size``、``epsilon``、``steps``、``log_every``。
+
+    Returns:
+        ``(model, history)``：
+
+        - ``model``: eval 模式下的训练后网络。
+        - ``history``: 日志行列表，每项含 ``step`` / ``loss`` / ``log_z``。
+
+    Raises:
+        FloatingPointError: 任一记录的 loss 或 log Z 非有限。
+    """
+    model = SetGFlowNet(
+        rngs=nnx.Rngs(args.seed),
+        learn_backward=args.backward == "learned",
+        width=args.width,
+    )
+    model.train()
+    optimizer = nnx.Optimizer(model, optax.adam(args.learning_rate), wrt=nnx.Param)
     key = jax.random.key(args.seed + 17)
     initial = jnp.zeros((args.batch_size, N_ITEMS), dtype=jnp.float32)
-    epsilon = jnp.asarray(0.2, dtype=jnp.float32)
-    history = []
+    epsilon = jnp.asarray(args.epsilon, dtype=jnp.float32)
+    history: list[dict] = []
     for step in range(args.steps):
         key, sample_key = jax.random.split(key)
         actions, _ = sample_actions(model, sample_key, initial, epsilon)
         loss = train_step(model, optimizer, actions)
-        if step % 500 == 0 or step == args.steps - 1:
-            row = {"step": step + 1, "loss": float(loss), "log_z": float(model.log_z.value)}
+        if step % args.log_every == 0 or step == args.steps - 1:
+            row = {
+                "step": step + 1,
+                "loss": float(loss),
+                "log_z": float(model.log_z[...]),
+            }
+            if not np.isfinite([row["loss"], row["log_z"]]).all():
+                raise FloatingPointError(
+                    f"Non-finite training state at step {step + 1}"
+                )
             history.append(row)
-            print(f"step={step + 1:4d} loss={row['loss']:.7f} logZ={row['log_z']:.6f}")
+            print(
+                f"step={step + 1:4d} loss={row['loss']:.7f} logZ={row['log_z']:.6f}",
+                flush=True,
+            )
+    model.eval()
     return model, history
 
 
-def enumerate_terminals() -> tuple[list[tuple[int, ...]], np.ndarray]:
-    """生成 10 个终态；仅供训练完成后的精确诊断。"""
-    subsets = list(combinations(range(N_ITEMS), SET_SIZE))
-    bits = np.zeros((len(subsets), N_ITEMS), dtype=np.float32)
-    for i, ids in enumerate(subsets):
-        bits[i, list(ids)] = 1.0
-    return subsets, bits
-
-
-def exact_diagnostics(model: SetGFlowNet) -> dict:
-    """枚举所有 60 条轨迹，区分真实模型误差和 Monte Carlo 采样误差。"""
-    subsets, bits = enumerate_terminals()
-    rewards = np.exp(np.asarray(log_reward(jnp.asarray(bits)), dtype=np.float64))
-    paths = jnp.asarray(list(permutations(range(N_ITEMS), SET_SIZE)), dtype=jnp.int32)
-    log_pf, log_pb, log_r, terminal = nnx.jit(trajectory_statistics)(model, paths)
-    pf, pb = np.exp(np.asarray(log_pf, dtype=np.float64)), np.exp(np.asarray(log_pb, dtype=np.float64))
-    group = np.all(np.asarray(terminal)[:, None, :] == bits[None, :, :], axis=-1)
-    model_p, backward_sums = pf @ group, pb @ group
-    residual = float(model.log_z.value) + np.asarray(log_pf) - np.asarray(log_r) - np.asarray(log_pb)
-    np.testing.assert_allclose(model_p.sum(), 1.0, atol=2e-6)
-    np.testing.assert_allclose(backward_sums, 1.0, atol=2e-6)
-    assert np.all(np.isfinite(residual)), "TB residual 必须有限"
-    return {
-        "subsets": [list(s) for s in subsets], "rewards": rewards.tolist(),
-        "target": (rewards / rewards.sum()).tolist(), "model": model_p.tolist(),
-        "log_z_exact": float(np.log(rewards.sum())), "log_z_learned": float(model.log_z.value),
-        "tv_exact": float(0.5 * np.abs(model_p - rewards / rewards.sum()).sum()),
-        "tb_rmse_all_paths": float(np.sqrt(np.mean(residual**2))),
-        "tb_max_abs_all_paths": float(np.max(np.abs(residual))),
-        "forward_path_sum": float(pf.sum()),
-        "backward_path_sums": backward_sums.tolist(),
-    }
-
-
-def sample_diagnostics(model: SetGFlowNet, n: int, seed: int) -> np.ndarray:
-    """用 epsilon=0 从学得的 P_F 直接采样；返回 10 个终态的经验频率。"""
-    initial = jnp.zeros((n, N_ITEMS), dtype=jnp.float32)
-    actions, terminal = sample_actions(model, jax.random.key(seed), initial, jnp.array(0.0))
-    actions, terminal = np.asarray(actions), np.asarray(terminal)
-    assert np.all(np.diff(np.sort(actions, axis=1), axis=1) > 0), "同一轨迹不能重复添加元素"
-    assert np.all(terminal.sum(axis=-1) == SET_SIZE), "采样必须在 3 元集合处结束"
-    _, bits = enumerate_terminals()
-    return np.all(terminal[:, None, :] == bits[None, :, :], axis=-1).mean(axis=0)
-
-
-def evaluate(model: SetGFlowNet, args: argparse.Namespace, history: list[dict]) -> dict:
-    """打印终态对照表，并返回可序列化的完整诊断结果。"""
-    result = exact_diagnostics(model)
-    empirical = sample_diagnostics(model, args.samples, args.seed + 2026)
-    result.update({"empirical": empirical.tolist(), "history": history,
-                   "backward": args.backward, "steps": args.steps, "seed": args.seed,
-                   "batch_size": args.batch_size, "samples": args.samples})
-    result["tv_empirical"] = float(0.5 * np.abs(empirical - result["target"]).sum())
-    result["versions"] = {"jax": jax.__version__, "flax": flax.__version__,
-                          "optax": optax.__version__, "numpy": np.__version__}
-    print("\nterminal      target     model(exact)  sampled")
-    for s, target, predicted, observed in zip(result["subsets"], result["target"], result["model"], empirical):
-        print(f"{str(tuple(s)):12s}  {target:.6f}   {predicted:.6f}      {observed:.6f}")
-    print(f"\nExact model TV = {result['tv_exact']:.7f}")
-    print(f"Empirical TV   = {result['tv_empirical']:.7f}  (n={args.samples})")
-    print(f"log Z learned  = {result['log_z_learned']:.7f}; exact = {result['log_z_exact']:.7f}")
-    print(f"All-path TB RMSE = {result['tb_rmse_all_paths']:.7f}")
-    return result
-
-
-def parse_args() -> argparse.Namespace:
-    """读取可复现实验配置；默认学习反向策略。"""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backward", choices=["learned", "uniform"], default="learned")
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--samples", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--report-json", type=Path, help="可选：把训练日志和诊断保存为 JSON")
-    args = parser.parse_args()
-    if min(args.steps, args.batch_size, args.samples) <= 0 or args.seed < 0:
-        parser.error("steps、batch-size、samples 必须为正数；seed 必须非负")
-    return args
+# Bind tutorial numerics into utility helpers so utility never imports this
+# module at runtime (avoids circular imports / double model copies).
+exact_diagnostics = partial(
+    exact_diagnostics,
+    log_reward=log_reward,
+    trajectory_statistics=trajectory_statistics,
+)
+generate_samples = partial(generate_samples, sample_actions=sample_actions)
+sample_diagnostics = partial(sample_diagnostics, generate_samples=generate_samples)
+load_model = partial(load_model, model_type=SetGFlowNet)
+evaluate = partial(
+    evaluate,
+    exact_diagnostics=exact_diagnostics,
+    generate_samples=generate_samples,
+)
 
 
 def main() -> None:
-    """训练，再独立验证；只有指定 --report-json 才额外写出结果文件。"""
+    """按 CLI 配置训练或加载 checkpoint，并写出实验报告。"""
     args = parse_args()
-    print(f"JAX {jax.__version__} | Flax {flax.__version__} | {jax.devices()}")
-    model, history = train(args)
-    report = evaluate(model, args, history)
-    if args.report_json is not None:
-        args.report_json.parent.mkdir(parents=True, exist_ok=True)
-        args.report_json.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.platform != "auto":
+        jax.config.update("jax_platforms", args.platform)
+    run_experiment(
+        args,
+        train=train,
+        load_model=load_model,
+        exact_diagnostics=exact_diagnostics,
+        generate_samples=generate_samples,
+        evaluate=evaluate,
+    )
 
 
 if __name__ == "__main__":

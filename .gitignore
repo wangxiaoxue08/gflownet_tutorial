@@ -12,3 +12,6 @@ wheels/
 # Local verification caches
 .pytest_cache/
 .ruff_cache/
+
+# Local experiment reports, samples, and trained models
+runs/

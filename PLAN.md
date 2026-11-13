@@ -1,28 +1,25 @@
-# CPU environment setup
+# Restyle tests, regenerate root report, cleanup
 
 ## Goal and constraints
-- Install the AGENTS.md stack with uv on this Windows x86-64 CPU-only PC.
-- Use JAX, Flax NNX, Optax, NumPyro, tensorflow-cpu (tf.data), and Optuna;
-  add Ruff and pytest as required development tools. Do not install GPU extras.
-- Preserve existing files and keep changes limited to environment setup and verification.
-- Replace the initial Python 3.14 requirement with Python 3.13: TensorFlow CPU
-  2.21.0 publishes Windows wheels through CPython 3.13, not 3.14.
+- Restyle `tests/test_gflownet.py` like the tutorial (`from ... import`).
+- Retrain with default settings; publish standalone HTML to repo-root
+  `experiment_report.html`.
+- Align tutorial `#run` facts with the new report; drop stale embedded source.
+- Remove temporary sync scripts and keep docs lean. Numerical training unchanged.
 
 ## Steps and status
-1. [done] Inspect repository instructions, configuration, available Python, and CPU wheels.
-2. [done] Configure Python 3.13, install runtime/development dependencies, and create uv.lock/.venv.
-3. [done] Add setup instructions and bounded CPU smoke tests for the required stack.
-4. [done] Run formatting, lint, tests, locked sync, and review final changes.
+1. [done] Restyle tests; add `--publish-report`.
+2. [done] Train learned + uniform; publish root report; sync tutorial tables/commands.
+3. [done] Slim PLAN/README; delete temp helpers; run lint/tests.
 
-## Verification
-- `uv sync --locked`: passed; 95 installed packages checked.
-- `uv run ruff check main.py tests`: passed.
-- `uv run ruff format --check main.py tests`: passed (3 files).
-- `uv run pytest -q tests/test_cpu_stack.py`: 4 passed in 47.80s.
-  Covers CPU devices, tf.data batches, NNX forward/loss/gradients/optimizer update,
-  small NumPyro inference, and a two-trial Optuna study.
-- Verified on Windows x86-64 with Python 3.13.5, JAX/jaxlib 0.12.0.1,
-  Flax 0.12.12, Optax 0.2.9, NumPyro 0.22.0, TensorFlow CPU 2.21.0,
-  and Optuna 5.0.0. Exact dependencies are recorded in uv.lock.
-- Reviewed setup files; existing tutorial Python/HTML files remain unchanged.
-- No full training, convergence claims, GPU tests, or performance benchmarks.
+## Verification / outcome
+- Pre-commit verification: Ruff lint and format checks passed for all six Python
+  files; `uv run pytest -q` passed all 10 tests on CPU.
+- Learned run: `runs/gflownet-20261113-seed0/` → root `experiment_report.html`
+  (TV_exact 0.0000191, TV_empirical 0.0091783, log Z 1.1069663).
+- Uniform run: `runs/gflownet-20261113-uniform/` (TV_exact 0.0000036,
+  TV_empirical 0.0055630).
+- Tutorial `#run` now matches these metrics and project `uv run python` workflow;
+  removed outdated PEP 723 / JAX 0.7.2 claims and the stale base64 full-source dump.
+- Remaining tutorial code excerpts are pedagogical snippets (may omit CLI /
+  utility split); canonical code is the `.py` files.
