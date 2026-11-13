@@ -1,4 +1,15 @@
-# Restyle tests, regenerate root report, cleanup
+# Link tutorial and report source references to GitHub
+
+## Current task
+- Goal: point code-file references in both HTML pages to the repository's
+  `master` branch; preserve executable commands and experiment artifact links.
+- Update the report renderer too so regenerated reports retain source links.
+- Steps: [done] update both HTML pages and report renderer; [done] verify changes.
+- Verification: all three source targets are present in both HTML pages and the
+  renderer, with no remaining local source links; diff check and Ruff lint/format
+  checks passed; `uv run pytest -q tests/test_gflownet.py`: 6 passed on CPU.
+
+## Previous task: restyle tests, regenerate root report, cleanup
 
 ## Goal and constraints
 - Restyle `tests/test_gflownet.py` like the tutorial (`from ... import`).

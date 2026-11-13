@@ -101,7 +101,7 @@ SOFTWARE.
 <div class="aside-intro">从一个未归一化分布出发，<br>学会完整对象的生成。</div>
 <div class="toc-label">阅读路线</div><nav aria-label="文章目录"><a href="#problem">01 · Motivation: 从玻尔兹曼分布中采样</a><a href="#flows">02 · 概率建模</a><a href="#occupancy" class="small" >P(s) 到底是什么？</a><a href="#thermo" class="small" >配分函数与自由能</a><a href="#tb-derivation" class="small" >逐项相乘得到 TB</a><a href="#learning">03 · 优化目标和参数化</a><a href="#implementation">04 · Flax.nnx 逐步实现</a><a href="#mask" class="small" >Masked softmax</a><a href="#sampling" class="small" >如何采 action</a><a href="#run" class="small" >运行与实测结果</a><a href="#extensions">迁移与推断</a><a href="#references">参考与复现</a></nav>
 <div class="aside-bottom">四部分 · 数学推导与代码对应<br>2026.11.11<br>
-<a class="button" href="gflownet_nnx_tutorial.py">打开 NNX 主脚本</a><br>
+<a class="button" href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/gflownet_nnx_tutorial.py">打开 NNX 主脚本</a><br>
 <a href="#full-source">查看完整源码</a></div></aside>
 <article><header class="hero" id="top">
   <div class="eyebrow">GENERATIVE FLOW NETWORKS · 从推导到实现</div>
@@ -854,11 +854,11 @@ uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </sp
 <details id="full-source"><summary>完整源码 · 以仓库 .py 文件为准</summary>
 <p>教程里的代码块只摘录核心步骤。完整可运行代码请直接打开仓库文件，不要依赖旧的内嵌副本：</p>
 <ul>
-<li><a href="gflownet_nnx_tutorial.py"><code>gflownet_nnx_tutorial.py</code></a>：奖励、策略网络、采样、TB loss、训练</li>
-<li><a href="utility.py"><code>utility.py</code></a>：CLI、精确诊断、checkpoint、实验产物</li>
-<li><a href="experiment_report.py"><code>experiment_report.py</code></a>：SVG / HTML 报告渲染</li>
+<li><a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/gflownet_nnx_tutorial.py"><code>gflownet_nnx_tutorial.py</code></a>：奖励、策略网络、采样、TB loss、训练</li>
+<li><a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/utility.py"><code>utility.py</code></a>：CLI、精确诊断、checkpoint、实验产物</li>
+<li><a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/experiment_report.py"><code>experiment_report.py</code></a>：SVG / HTML 报告渲染</li>
 </ul>
-<p><a class="button secondary" href="gflownet_nnx_tutorial.py">打开主脚本</a>
+<p><a class="button secondary" href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/gflownet_nnx_tutorial.py">打开主脚本</a>
 <a class="button secondary" href="experiment_report.html">打开最新实验报告</a></p>
 </details>
 </section>

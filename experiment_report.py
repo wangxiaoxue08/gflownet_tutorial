@@ -321,6 +321,7 @@ model.msgpack 保存全部模型变量、架构、训练配置和历史，供加
 # 独立进程加载本次模型并采样（自动创建新输出目录）
 {escape(sample_command)}</pre>
 <div class="links"><a href="model.msgpack">训练后的模型</a><a href="samples.csv">全部生成样本 CSV</a><a href="distribution.csv">分布对比 CSV</a><a href="metrics.json">原始指标 JSON</a><a href="distribution.svg">分布图 SVG</a><a href="training.svg">训练图 SVG</a></div>
+<p>GitHub 源码：<a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/gflownet_nnx_tutorial.py"><code>gflownet_nnx_tutorial.py</code></a> · <a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/utility.py"><code>utility.py</code></a> · <a href="https://github.com/wangxiaoxue08/gflownet_tutorial/blob/master/experiment_report.py"><code>experiment_report.py</code></a>。</p>
 <p class="muted">HTML 内嵌图表，可以单独离线阅读；下载链接需与同目录文件一起保留。运行目录还保存脚本、pyproject.toml 和 uv.lock 快照。</p>
 <details><summary>配置、版本、硬件与文件校验</summary><pre>{metadata}</pre></details></section>
 </main></body></html>"""
