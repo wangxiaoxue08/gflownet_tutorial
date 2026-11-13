@@ -1,4 +1,16 @@
-# Link tutorial and report source references to GitHub
+# Convert the HTML tutorial to Markdown
+
+## Conversion task
+- Goal: create `gflownet_tutorial.md` without changing the source HTML.
+- Preserve prose, LaTeX math, code blocks, tables, links, and both DAG figures.
+- Use the standard library; no new project dependencies.
+- Steps: [done] create Markdown and extract both SVG figures under
+  `assets/gflownet_tutorial/`; [done] compare against the unchanged HTML source.
+- Verification: preserved 380 formulas, 12 verbatim code blocks, 11 tables,
+  36 headings and 19 article links; checked internal anchors and parsed both
+  SVGs as XML. Reviewed Markdown and diff; no model changes or model tests.
+
+## Previous task: link tutorial and report source references to GitHub
 
 ## Current task
 - Goal: point code-file references in both HTML pages to the repository's
